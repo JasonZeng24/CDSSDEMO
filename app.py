@@ -1,6 +1,31 @@
+import os
 import sqlite3
+import urllib.request
 import pandas as pd
 import streamlit as st
+
+# --- 1. 自动从 GitHub Release 缓存下载 DB 文件 ---
+DB_PATH = "weblog_corpus.db"
+RELEASE_URL = "https://github.com/JasonZeng24/CDSSDEMO/releases/download/v1.0/weblog_corpus.db"
+
+@st.cache_resource(show_spinner=False)
+def ensure_database():
+    if not os.path.exists(DB_PATH):
+        with st.spinner("Downloading Brad DeLong's Corpus Database (~100MB+)... Please wait a few seconds."):
+            urllib.request.urlretrieve(RELEASE_URL, DB_PATH)
+
+ensure_database()
+
+# 页面配置与后续逻辑
+st.set_page_config(
+    page_title="Brad DeLong's Weblog Archive (1995–2005)",
+    page_icon="🏛️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+def get_db_connection():
+    return sqlite3.connect(DB_PATH)
 
 # 1. 网页标题与标签栏图标
 st.set_page_config(
