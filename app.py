@@ -140,11 +140,15 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
             else f"Missing {row['missing_imgs']} Images"
         )
 
-        # 路径清理与 URL 拼接：必须放置在 for 循环内部执行
+        # 1. 规范化路径：将可能存在的双中划线转回标准路径，并补齐扩展名
         clean_path = str(row["rel_path"]).replace("\\", "/").lstrip("/")
+        clean_path = clean_path.replace("--", "/")
         if clean_path.startswith("movable_type/"):
-          clean_path = clean_path[len("movable_type/") :]
+            clean_path = clean_path[len("movable_type/") :]
+        if not clean_path.endswith(".html") and not clean_path.endswith(".htm"):
+          clean_path += ".html"
 
+# 2. 拼接完整的历史 URL 与 Wayback 查询地址
         original_url = urllib.parse.urljoin(HISTORICAL_BASE_URL, clean_path)
         wayback_url = f"https://web.archive.org/web/*/{original_url}"
 
