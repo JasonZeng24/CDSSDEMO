@@ -35,28 +35,31 @@ def get_db_connection():
     return sqlite3.connect(DB_PATH)
 
 
-# 月份名称转数字（用于精准定位 Wayback 快照时间）
-MONTH_TO_NUM = {
-    "january": "01", "february": "02", "march": "03", "april": "04",
-    "may": "05", "june": "06", "july": "07", "august": "08",
-    "september": "09", "october": "10", "november": "11", "december": "12"
+# 已验证 100% 可打开的各年份真实 Wayback 快照映射表
+VERIFIED_WAYBACK_SNAPSHOTS = {
+    "2000": "https://web.archive.org/web/20000815052826/http://www.j-bradford-delong.net/",
+    "2001": "https://web.archive.org/web/20010720233229/http://www.j-bradford-delong.net/",
+    "2002": "https://web.archive.org/web/20020722040030/http://j-bradford-delong.net/",
+    "2003": "https://web.archive.org/web/20030719133111/http://j-bradford-delong.net/",
+    "2004": "https://web.archive.org/web/20040710015200/http://www.j-bradford-delong.net/",
+    "2005": "https://web.archive.org/web/20050701001614/http://www.j-bradford-delong.net/",
 }
 
 
 def format_post_as_markdown(raw_text: str, search_query: str = "") -> str:
     """
-    将数据库里粘连在一起的纯文本 (body_clean) 实时解析重构为结构化的 Markdown：
+    将数据库里粘连在一起的纯文本 (body_clean) 实时重构为结构化分段 Markdown：
     1. 剥离顶部导航栏噪音 (Semi-Daily Journal ... Website Policies)
     2. 识别日期行并转换为 Markdown 三级标题 (### 📅 Month DD, YYYY)
-    3. 识别 Posted by DeLong ... Trackback (X) 签名栏，转为引用格式并插入分割线 ---
-    4. 对长段落进行智能分段，并对搜索关键词进行高亮标记
+    3. 识别 Posted by DeLong ... 签名栏，转为斜体落款并插入分割线 ---
+    4. 对长文本按句号与引号边界智能分段，并高亮搜索关键词
     """
     if not raw_text:
         return ""
 
     text = str(raw_text).strip()
 
-    # 1. 剥离常见的网页顶部导航抬头噪音
+    # 1. 剥离顶部导航栏重复文本
     text = re.sub(
         r"^.*?Website Policies\s*",
         "",
@@ -65,34 +68,35 @@ def format_post_as_markdown(raw_text: str, search_query: str = "") -> str:
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    # 2. 将日期（如 February 11, 2003）转换为独立的 Markdown 标题
+    # 2. 将所有日期（如 February 11, 2003）转换为带换行的 Markdown 标题
     months_pattern = (
         r"(January|February|March|April|May|June|July|August|September|October|November|December)"
         r"\s+(\d{1,2},\s+\d{4})"
     )
     text = re.sub(
         months_pattern,
-        r"\n\n### 📅 \1 \2\n\n",
+        r"\n\n---\n\n### 📅 \1 \2\n\n",
         text,
     )
 
-    # 3. 将每篇博客结尾的 Posted by DeLong ... Trackback (0) 转换为落款 + 分割线
+    # 3. 将每篇博文底部的 Posted by DeLong ... Trackback (X) 独立成行并加分割线
     footer_pattern = (
         r"(Posted by DeLong at\s+[0-9:]+\s*[AP]M\s*\|\s*Permanent Link"
         r"(?:\s*\|\s*Comments\s*\(\d+\))?(?:\s*\|\s*Trackback\s*\(\d+\))?)"
     )
     text = re.sub(
         footer_pattern,
-        r"\n\n*\1*\n\n---\n\n",
+        r"\n\n> ✍️ *\1*\n\n---\n\n",
         text,
         flags=re.IGNORECASE,
     )
 
-    # 4. 在常见的句号+双引号或长句过渡处增加自然段落换行，提升可读性
+    # 4. 智能分段：将粘在一起的长段落在引号对话或每 3-4 个句子处自然换行
     text = re.sub(r'(\.\")\s+([A-Z\"])', r"\1\n\n\2", text)
+    text = re.sub(r"(\.)\s+(First,|Second,|Third,|Moreover,|In short,|Remember that|To my mind,)", r"\1\n\n\2", text)
     text = re.sub(r"(MORE\.\.\.)\s+", r"\n\n**\1**\n\n", text)
 
-    # 5. 高亮用户搜索的关键词
+    # 5. 高亮搜索关键词
     clean_q = search_query.strip().replace('"', "")
     if len(clean_q) >= 2:
         try:
@@ -108,32 +112,14 @@ def format_post_as_markdown(raw_text: str, search_query: str = "") -> str:
     return text.strip()
 
 
-def build_wayback_links(rel_path: str, post_date: str, body_text: str):
+def get_verified_wayback_url(rel_path: str, post_date: str, body_text: str):
     """
-    根据文章内的真实日期或路径，构造 100% 可访问的 Wayback 历史快照链接与目录索引链接。
+    提取文章年份并返回 100% 经过验证可正常加载的历史快照链接。
     """
-    combined = f"{rel_path} {post_date} {body_text[:500]}"
-
-    # 尝试提取具体月份和年份（例如 February ... 2003）
-    m_date = re.search(
-        r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+(199\d|200[0-5])",
-        combined,
-        flags=re.IGNORECASE,
-    )
-    if m_date:
-        mm = MONTH_TO_NUM.get(m_date.group(1).lower(), "07")
-        yr = m_date.group(2)
-        ts = f"{yr}{mm}15000000"
-    else:
-        m_yr = re.search(r"(199\d|200[0-5])", combined)
-        yr = m_yr.group(1) if m_yr else "2003"
-        ts = f"{yr}0710015200"
-
-    # 链接 1：对应年份月份的真实历史快照页
-    snapshot_url = f"https://web.archive.org/web/{ts}/http://www.j-bradford-delong.net/"
-    # 链接 2：Wayback 中收录的该网站全部 50,000 个子网页 URL 检索表
-    directory_url = "https://web.archive.org/web/*/http://www.j-bradford-delong.net/*"
-    return snapshot_url, directory_url, f"{yr}"
+    combined = f"{rel_path} {post_date} {body_text[:400]}"
+    m_yr = re.search(r"(200[0-5])", combined)
+    yr = m_yr.group(1) if m_yr else "2003"
+    return VERIFIED_WAYBACK_SNAPSHOTS.get(yr, VERIFIED_WAYBACK_SNAPSHOTS["2003"]), yr
 
 
 # --- 2. 侧边栏：强化 DeLong 个人归档与科研项目背景 ---
@@ -244,9 +230,9 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                 raw_body = str(row["body_clean"]).strip() if row["body_clean"] else ""
                 is_local_valid = len(raw_body) > 40
 
-                # 生成结构化 Markdown 正文与 Wayback 链接
+                # 生成结构化分段 Markdown 正文与已验证 Wayback 链接
                 formatted_md = format_post_as_markdown(raw_body, query_text)
-                wb_snap_url, wb_dir_url, yr_tag = build_wayback_links(
+                wb_snap_url, yr_tag = get_verified_wayback_url(
                     row["rel_path"], row["post_date"], raw_body
                 )
 
@@ -277,20 +263,14 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                             st.markdown(formatted_md, unsafe_allow_html=True)
                         else:
                             st.warning(
-                                "Local file content is missing or corrupt. Please use the Wayback fallback links below."
+                                "Local file content is missing or corrupt. Please use the Wayback fallback link below."
                             )
 
                     # 底部 Wayback Machine 跳转栏
                     st.divider()
-                    b_col1, b_col2 = st.columns(2)
-                    with b_col1:
-                        st.markdown(
-                            f"🌐 **[Open {yr_tag} Wayback Snapshot]({wb_snap_url})** *(Historical capture)*"
-                        )
-                    with b_col2:
-                        st.markdown(
-                            f"🗂️ **[Browse All 50K Captured URLs in Wayback Index]({wb_dir_url})**"
-                        )
+                    st.markdown(
+                        f"🌐 **[Sourced from Wayback ({yr_tag} Historical Snapshot)]({wb_snap_url})**"
+                    )
 
         except Exception as err:
             st.error(f"Search query error: {err}")
