@@ -1,14 +1,15 @@
 import html as htmllib
+import json
 import os
 import re
 import sqlite3
 import urllib.request
+from datetime import datetime
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-import json
-from urllib.parse import quote
 
 # --- 1. 自动从 GitHub Release 缓存下载 DB 文件 ---
 DB_PATH = "weblog_corpus.db"
@@ -39,7 +40,14 @@ def get_db_connection():
     return sqlite3.connect(DB_PATH)
 
 
-# 已验证 100% 可打开的各年份真实 Wayback 快照映射表
+# ---------------------------------------------------------------------------
+# Wayback 相关
+# 原站文章真实 URL 格式：
+#   http://www.j-bradford-delong.net/movable_type/2003_archives/001221.html
+# ---------------------------------------------------------------------------
+SITE_HOSTS = ("www.j-bradford-delong.net", "j-bradford-delong.net")
+
+# 各年份首页快照（兜底用）
 VERIFIED_WAYBACK_SNAPSHOTS = {
     "2000": "https://web.archive.org/web/20000815052826/http://www.j-bradford-delong.net/",
     "2001": "https://web.archive.org/web/20010720233229/http://www.j-bradford-delong.net/",
@@ -49,7 +57,76 @@ VERIFIED_WAYBACK_SNAPSHOTS = {
     "2005": "https://web.archive.org/web/20050701001614/http://www.j-bradford-delong.net/",
 }
 
-# --- HTML 阅读器：正则与样式 ---
+
+def get_wayback_info(rel_path: str, post_date: str, body_text: str):
+    """
+    返回 (年份首页快照, 年份, 时间戳, 候选原站URL列表, 年份日历页)
+    """
+    rel = str(rel_path or "").replace("\\", "/").strip()
+    pdate = str(post_date or "").strip()
+
+    # 年份 + 精确日期（用于让 Wayback 找最接近的快照）
+    dt = None
+    try:
+        dt = datetime.strptime(pdate, "%B %d, %Y")
+    except Exception:
+        pass
+
+    if dt:
+        yr = str(dt.year)
+        ts = dt.strftime("%Y%m%d")
+    else:
+        m_yr = re.search(r"(200[0-5])", f"{rel} {pdate} {body_text[:400]}")
+        yr = m_yr.group(1) if m_yr else "2003"
+        ts = f"{yr}0701"
+
+    # 候选原站 URL
+    paths = []
+    # 情况 1：rel_path 本身就含 movable_type/... 完整路径
+    m = re.search(r"(movable_type/.+?\.html?)$", rel, re.IGNORECASE)
+    if m:
+        paths.append(m.group(1))
+    # 情况 2：从文件名里取文章 ID，按年份重建
+    m = re.search(r"(\d{4,7})\.html?$", rel, re.IGNORECASE)
+    if m:
+        paths.append(f"movable_type/{yr}_archives/{m.group(1)}.html")
+
+    urls = []
+    for p in paths:
+        for host in SITE_HOSTS:
+            u = f"http://{host}/{p}"
+            if u not in urls:
+                urls.append(u)
+
+    home = VERIFIED_WAYBACK_SNAPSHOTS.get(yr, VERIFIED_WAYBACK_SNAPSHOTS["2003"])
+    calendar = f"https://web.archive.org/web/{yr}*/http://www.j-bradford-delong.net/*"
+    return home, yr, ts, urls, calendar
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def find_closest_snapshot(urls: tuple, ts: str):
+    """依次查询 Wayback 官方接口，返回 (命中链接或None, 调试信息列表)。"""
+    debug = []
+    for u in urls:
+        api = (
+            "https://archive.org/wayback/available?url="
+            f"{quote(u, safe='')}&timestamp={ts}"
+        )
+        try:
+            with urllib.request.urlopen(api, timeout=10) as r:
+                data = json.load(r)
+            snap = data.get("archived_snapshots", {}).get("closest")
+            if snap and snap.get("available"):
+                return snap["url"].replace("http://", "https://", 1), debug
+            debug.append(f"{u} -> API OK, but no snapshot")
+        except Exception as e:
+            debug.append(f"{u} -> API failed: {type(e).__name__}: {e}")
+    return None, debug
+
+
+# ---------------------------------------------------------------------------
+# HTML 阅读器
+# ---------------------------------------------------------------------------
 MONTHS = (
     "January|February|March|April|May|June|July|August|September|October|November|December"
 )
@@ -84,14 +161,14 @@ READER_CSS = """
 
 
 def _highlight(escaped_text: str, query: str) -> str:
-    """在已转义的文本上高亮关键词，同时跳过 &amp; 之类的 HTML 实体，避免破坏它们。"""
+    """在已转义的文本上高亮关键词，跳过 &amp; 之类的 HTML 实体。"""
     if len(query) < 2:
         return escaped_text
     q = re.escape(htmllib.escape(query))
     pattern = re.compile(rf"(&#?\w+;)|({q})", re.IGNORECASE)
 
     def repl(m):
-        if m.group(1):  # 是实体，原样保留
+        if m.group(1):
             return m.group(1)
         return f"<mark>{m.group(2)}</mark>"
 
@@ -155,41 +232,6 @@ def format_post_as_html(raw_text: str, search_query: str = "") -> str:
     )
 
 
-SITE = "http://www.j-bradford-delong.net/"
-
-
-def get_verified_wayback_url(rel_path: str, post_date: str, body_text: str):
-    """返回 (年份首页快照, 年份, 文章原始URL猜测, 年份日历页)"""
-    combined = f"{rel_path} {post_date} {body_text[:400]}"
-    m_yr = re.search(r"(200[0-5])", combined)
-    yr = m_yr.group(1) if m_yr else "2003"
-    home = VERIFIED_WAYBACK_SNAPSHOTS.get(yr, VERIFIED_WAYBACK_SNAPSHOTS["2003"])
-    path = str(rel_path or "").replace("\\", "/").lstrip("./")
-    post_url = SITE + quote(path) if path else ""
-    calendar = f"https://web.archive.org/web/{yr}*/{SITE}*"
-    return home, yr, post_url, calendar
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def find_closest_snapshot(url: str, yr: str):
-    """查询 Wayback 官方接口，返回最近的真实快照链接，查不到返回 None。"""
-    if not url:
-        return None
-    try:
-        api = (
-            "https://archive.org/wayback/available?url="
-            f"{quote(url, safe='')}&timestamp={yr}0701"
-        )
-        with urllib.request.urlopen(api, timeout=8) as r:
-            data = json.load(r)
-        snap = data.get("archived_snapshots", {}).get("closest")
-        if snap and snap.get("available"):
-            return snap["url"].replace("http://", "https://", 1)
-    except Exception:
-        pass
-    return None
-
-
 # --- 2. 侧边栏 ---
 st.sidebar.title("🏛️ Brad DeLong's Corpus")
 st.sidebar.caption("UC Berkeley Economics | Pre-2005 Archive")
@@ -236,7 +278,7 @@ nav_mode = st.sidebar.radio(
     ],
 )
 
-# --- 3. 页面 1：全文检索与 HTML 正文渲染 ---
+# --- 3. 页面 1：全文检索 ---
 if nav_mode == "DeLong Full-Text Search (FTS5)":
     st.title("Search Brad DeLong's Weblog Archive")
     st.markdown(
@@ -298,7 +340,7 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                 raw_body = str(row["body_clean"]).strip() if row["body_clean"] else ""
                 is_local_valid = len(raw_body) > 40
 
-                wb_home, yr_tag, post_orig_url, wb_calendar = get_verified_wayback_url(
+                wb_home, yr_tag, wb_ts, post_urls, wb_calendar = get_wayback_info(
                     row["rel_path"], row["post_date"], raw_body
                 )
 
@@ -323,31 +365,51 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                         unsafe_allow_html=True,
                     )
 
-                    # HTML 全文阅读器（用 toggle 代替嵌套 expander，Streamlit 不允许 expander 嵌套）
+                    # HTML 全文阅读器（toggle 代替嵌套 expander）
                     if st.toggle("📖 Read Full Article", key=f"read_{row['id']}"):
                         if is_local_valid:
                             doc = format_post_as_html(raw_body, query_text)
                             components.html(doc, height=650, scrolling=True)
                         else:
                             st.warning(
-                                "Local file content is missing or corrupt. Please use the Wayback fallback link below."
+                                "Local file content is missing or corrupt. Please use the Wayback link below."
                             )
 
-                    # 底部 Wayback Machine 跳转栏
+                    # Wayback 链接
                     st.divider()
-                    if st.button("🔎 Find closest Wayback snapshot of this post", key=f"wb_{row['id']}"):
-                        hit = find_closest_snapshot(post_orig_url, yr_tag)
-                        if hit:
-                            st.markdown(f"✅ **[Open this post's snapshot]({hit})**")
-                        else:
-                            st.info(
-                                "No snapshot of this exact page was found. "
-                                "Try the year homepage or calendar below."
+                    links = []
+                    if post_urls:
+                        # 直达链接：Wayback 会自动跳到离该日期最近的快照
+                        direct = f"https://web.archive.org/web/{wb_ts}/{post_urls[0]}"
+                        links.append(f"**[🌐 Open this post on Wayback]({direct})**")
+                    links.append(f"[{yr_tag} homepage snapshot]({wb_home})")
+                    links.append(f"[Browse all {yr_tag} captures]({wb_calendar})")
+                    st.markdown(" · ".join(links))
+
+                    # 可选：用官方接口确认该文章是否真的有存档，并显示调试信息
+                    if st.toggle(
+                        "🔎 Check availability & debug", key=f"wb_{row['id']}"
+                    ):
+                        if post_urls:
+                            hit, debug = find_closest_snapshot(tuple(post_urls), wb_ts)
+                            if hit:
+                                st.success("Snapshot found.")
+                                st.markdown(f"[Open closest snapshot]({hit})")
+                            else:
+                                st.info(
+                                    "No snapshot of this exact page was found. "
+                                    "Use the homepage or calendar links above."
+                                )
+                            st.code(
+                                f"rel_path = {row['rel_path']!r}\n"
+                                f"post_date = {row['post_date']!r}\n"
+                                + "\n".join(debug or ["(all lookups returned a hit)"])
                             )
-                    st.markdown(
-                        f"🌐 [{yr_tag} homepage snapshot]({wb_home}) · "
-                        f"[Browse all {yr_tag} captures]({wb_calendar})"
-                    )
+                        else:
+                            st.warning(
+                                "Could not derive a post URL from rel_path."
+                            )
+                            st.code(f"rel_path = {row['rel_path']!r}")
 
         except Exception as err:
             st.error(f"Search query error: {err}")
