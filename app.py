@@ -8,7 +8,16 @@ import streamlit as st
 # --- 1. 自动从 GitHub Release 缓存下载 DB 文件 ---
 DB_PATH = "weblog_corpus.db"
 RELEASE_URL = "https://github.com/JasonZeng24/CDSSDEMO/releases/download/v1.0/weblog_corpus.db"
-HISTORICAL_BASE_URL = "http://www.j-bradford-delong.net/"
+# 确保基准前缀包含 movable_type/
+HISTORICAL_BASE_URL = "http://www.j-bradford-delong.net/movable_type/"
+
+# 拼接时剥离可能重复的路径前缀
+clean_path = str(row["rel_path"]).replace("\\", "/").lstrip("/")
+if clean_path.startswith("movable_type/"):
+  clean_path = clean_path[len("movable_type/") :]
+
+original_url = urllib.parse.urljoin(HISTORICAL_BASE_URL, clean_path)
+wayback_url = f"https://web.archive.org/web/*/{original_url}"
 
 st.set_page_config(
     page_title="Brad DeLong's Weblog Archive (1995–2005)",
