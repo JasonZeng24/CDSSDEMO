@@ -1,9 +1,9 @@
 import os
 import re
+import json
 import sqlite3
 import urllib.parse
 import urllib.request
-import json
 import pandas as pd
 import streamlit as st
 
@@ -36,90 +36,49 @@ def get_db_connection():
     return sqlite3.connect(DB_PATH)
 
 
-# 月份英文名转两位数字映射表
-MONTH_MAP = {
-    "january": "01", "february": "02", "march": "03", "april": "04",
-    "may": "05", "june": "06", "july": "07", "august": "08",
-    "september": "09", "october": "10", "november": "11", "december": "12"
-}
-
-
-@st.cache_data(show_spinner=False)
-def resolve_wayback_url(rel_path: str, post_date: str) -> str:
+@st.cache_data(show_spinner=False, ttl=3600)
+def query_cdx_snapshots(rel_path: str, post_date: str):
     """
-    将本地自定义 rel_path 还原为当年 j-bradford-delong.net 上的具体文章/归档页 URL，
-    并通过 Wayback CDX API 查找最匹配的真实快照页面。
+    使用标准的 Wayback CDX Server API (matchType=prefix + 正则 filter)
+    查找与当前本地文件最匹配的真实历史快照 URL 列表。
     """
     clean_p = str(rel_path).replace("\\", "/").lstrip("/")
     
-    # 剔除本地外层文件夹前缀（如果有）
-    for prefix in ["web_assets_cleaned/", "delong_archive/", "archive/"]:
-        if clean_p.startswith(prefix):
-            clean_p = clean_p[len(prefix):]
-
-    candidates = []
-
-    # 1. 处理类似 '2003_archives--July' 的月度归档文件名
-    m_month = re.search(r"(\d{4})_archives(?:--|/|-)?([A-Za-z]+)", clean_p)
-    if m_month:
-        yr, m_name = m_month.group(1), m_month.group(2).lower()
-        if m_name in MONTH_MAP:
-            mm = MONTH_MAP[m_name]
-            # Movable Type 当年真实的月度归档 URL 格式
-            candidates.append(f"http://www.j-bradford-delong.net/movable_type/{yr}_archives/{yr}_{mm}.html")
-            candidates.append(f"http://www.j-bradford-delong.net/movable_type/archives/{yr}_{mm}.html")
-
-    # 2. 处理将 '--' 转回 '/' 后的原始相对路径
-    restored_path = clean_p.replace("--", "/")
-    if restored_path.startswith("movable_type/"):
-        sub_p = restored_path[len("movable_type/"):]
-    else:
-        sub_p = restored_path
-
-    # 候选路径：带 movable_type 和直接挂在根域名下的具体页面
-    candidates.append(f"http://www.j-bradford-delong.net/movable_type/{sub_p}")
-    candidates.append(f"http://www.j-bradford-delong.net/{sub_p}")
-    if not sub_p.endswith(".html") and not sub_p.endswith(".htm"):
-        candidates.append(f"http://www.j-bradford-delong.net/movable_type/{sub_p}.html")
-        candidates.append(f"http://www.j-bradford-delong.net/{sub_p}.html")
-
-    # 3. 依次通过 Wayback CDX API 检查哪个候选具体页面真实存在快照
-    for cand_url in candidates:
-        cdx_api = (
-            f"https://web.archive.org/cdx/search/cdx?"
-            f"url={urllib.parse.quote(cand_url)}&output=json&fl=timestamp,original&filter=statuscode:200&limit=1"
+    # 提取有辨识度的文件名或目录关键词（去掉无意义的后缀和横杠）
+    # 例如 '2003_archives--July' -> 提取 '2003' 和 'July' 或具体文件名
+    tokens = [t for t in re.split(r"[/\-_.]", clean_p) if len(t) >= 3 and t.lower() not in ("html", "htm", "txt", "www", "net", "delong", "bradford", "archives", "movable", "type")]
+    
+    # 优先使用最具体的末尾文件名 token
+    keyword = tokens[-1] if tokens else "2003"
+    
+    # 构造符合 CDX 官方规范的 API URL（绝不在 domain 中间加 *）
+    api_url = (
+        "https://web.archive.org/cdx/search/cdx?"
+        "url=j-bradford-delong.net/&matchType=prefix"
+        "&filter=statuscode:200"
+        "& filter=mimetype:text/html".replace(" ", "") +
+        f"&filter=~original:(?i){urllib.parse.quote(keyword)}"
+        "&collapse=urlkey&output=json&fl=timestamp,original&limit=10"
+    )
+    
+    try:
+        req = urllib.request.Request(
+            api_url, 
+            headers={"User-Agent": "UCBerkeley-DSDiscovery-Research/1.0"}
         )
-        try:
-            req = urllib.request.Request(cdx_api, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=2.0) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                if len(data) > 1:  # data[0] 是表头 ['timestamp', 'original']
-                    ts, orig = data[1][0], data[1][1]
-                    return f"https://web.archive.org/web/{ts}/{orig}"
-        except Exception:
-            pass
-
-    # 4. 如果精确文件名因当年重命名找不到，用文件前缀模糊搜索 CDX 目录下的最近页面
-    base_slug = os.path.splitext(os.path.basename(restored_path))[0]
-    if len(base_slug) >= 4:
-        cdx_prefix_api = (
-            f"https://web.archive.org/cdx/search/cdx?"
-            f"url=j-bradford-delong.net/*{urllib.parse.quote(base_slug)}*&output=json&fl=timestamp,original&filter=statuscode:200&limit=1"
-        )
-        try:
-            req = urllib.request.Request(cdx_prefix_api, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=2.0) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                if len(data) > 1:
-                    ts, orig = data[1][0], data[1][1]
-                    return f"https://web.archive.org/web/{ts}/{orig}"
-        except Exception:
-            pass
-
-    # 5. 最终保底：跳到该文章所属年份/日期的具体时间轴快照
-    m_yr = re.search(r"(199\d|200[0-5])", clean_p + " " + str(post_date))
-    yr = m_yr.group(1) if m_yr else "2004"
-    return f"https://web.archive.org/web/{yr}0710015200/http://www.j-bradford-delong.net/"
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if len(data) > 1:
+                # 返回 [(timestamp, original_url, wayback_full_link), ...]
+                results = []
+                for item in data[1:]:
+                    ts, orig = item[0], item[1]
+                    wb_link = f"https://web.archive.org/web/{ts}/{orig}"
+                    results.append({"timestamp": ts, "original_url": orig, "wayback_url": wb_link})
+                return results
+    except Exception:
+        pass
+    return []
 
 
 # --- 2. 侧边栏：强化 DeLong 个人归档与科研项目背景 ---
@@ -174,7 +133,7 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
     st.markdown(
         "**Explore 21,500+ original posts and economic commentary from Brad"
         " DeLong's *Semi-Daily Journal* (Pre-2005).**  \n*Powered by SQLite FTS5"
-        " for instant sub-second contextual querying.*"
+        " & Wayback Machine CDX API Integration.*"
     )
 
     col1, col2 = st.columns([3, 1])
@@ -222,44 +181,62 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                 )
                 status_color = "green" if row["missing_imgs"] == 0 else "orange"
                 status_label = (
-                    "Complete Assets"
+                    "Complete Local Assets"
                     if row["missing_imgs"] == 0
                     else f"Missing {row['missing_imgs']} Images"
                 )
-
-                # 解析该条文章在 Wayback Machine 上的真实快照地址
-                wayback_url = resolve_wayback_url(row["rel_path"], row["post_date"])
+                
+                body_str = str(row["body_clean"]).strip() if row["body_clean"] else ""
+                is_local_valid = len(body_str) > 40
 
                 with st.expander(
                     f"📝 {post_title} ({row['post_date']})", expanded=True
                 ):
+                    # 顶部状态徽章栏
+                    badge_col1, badge_col2 = st.columns([3, 1])
+                    with badge_col1:
+                        st.caption(
+                            f"Record ID: `{row['id']}` | Local File: `{row['rel_path']}` | Integrity: :{status_color}[{status_label}]"
+                        )
+                    with badge_col2:
+                        if is_local_valid:
+                            st.markdown(":green-background[✅ Rendered from Local Archive]")
+                        else:
+                            st.markdown(":blue-background[🌐 Sourced from Wayback Fallback]")
+
+                    # 匹配高亮摘要
                     st.markdown(
                         f"**Matched Excerpt:**\n> {row['snippet_text']}",
                         unsafe_allow_html=True,
                     )
 
-                    # Step 1 核心功能：全文可折叠渲染
-                    with st.expander("📖 Read Full Article (Cleaned Text)"):
-                        if row["body_clean"] and str(row["body_clean"]).strip():
-                            st.markdown(row["body_clean"])
+                    # Step 1 核心要求：直接内置干净的全文阅读器 (Content Renderer)
+                    with st.expander("📖 Read Full Article Text (Markdown Renderer)", expanded=False):
+                        if is_local_valid:
+                            st.markdown(body_str)
                         else:
-                            st.info(
-                                "Full text body unavailable in local database cache. Access"
-                                " the preserved snapshot via Wayback below."
-                            )
+                            st.warning("Local file is truncated or missing. Fetching from Wayback CDX API...")
 
-                    st.divider()
-                    meta_col1, meta_col2 = st.columns([2, 1])
-                    with meta_col1:
-                        st.caption(
-                            f"Original File: `{row['rel_path']}` | Integrity:"
-                            f" :{status_color}[{status_label}]"
-                        )
-                    with meta_col2:
-                        st.markdown(
-                            f"[:blue-background[🌐 Sourced from Wayback]]({wayback_url})",
-                            help="Open external archival snapshot in Internet Archive",
-                        )
+                    # Step 2 集成：按需实时调用 Wayback CDX API 查找该文件的精确历史 URL
+                    with st.expander("🌐 Wayback Machine CDX Lookup (Verify External Snapshots)", expanded=not is_local_valid):
+                        if st.button(f"🔍 Query CDX API for `{row['rel_path']}`", key=f"cdx_btn_{row['id']}"):
+                            with st.spinner("Querying Internet Archive CDX Server API..."):
+                                cdx_hits = query_cdx_snapshots(row["rel_path"], row["post_date"])
+                                if cdx_hits:
+                                    st.success(f"Found {len(cdx_hits)} matching archival snapshots on Wayback Machine:")
+                                    for hit in cdx_hits:
+                                        st.markdown(
+                                            f"- **[{hit['original_url']}]({hit['wayback_url']})** (Captured: `{hit['timestamp'][:8]}`)"
+                                        )
+                                else:
+                                    # 如果文件名是纯本地重命名的，提供一个去 Wayback 搜索该路径关键词的直达入口
+                                    m_yr = re.search(r"(199\d|200[0-5])", str(row["rel_path"]) + " " + str(row["post_date"]))
+                                    yr = m_yr.group(1) if m_yr else "2003"
+                                    fallback_archive = f"https://web.archive.org/web/{yr}0701000000*/http://www.j-bradford-delong.net/*"
+                                    st.info(
+                                        f"Filename `{row['rel_path']}` was renamed locally during the legacy scrape. "
+                                        f"[👉 Browse all {yr} URLs in Wayback Machine Directory]({fallback_archive})"
+                                    )
 
         except Exception as err:
             st.error(f"Search query error: {err}")
