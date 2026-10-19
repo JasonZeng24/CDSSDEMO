@@ -111,6 +111,8 @@ def get_wayback_info(rel_path: str, post_date: str, body_text: str):
                 # 本地目录丢掉了 movable_type/ 这一层，补回去
                 prefixed = ["movable_type"] + parts
                 paths.append("/".join(quote(c) for c in prefixed))
+                # 备选：月度/周度/分类页有时直接放在 movable_type/ 根下
+                paths.append(f"movable_type/{quote(fname)}")
                 # 分卷目录（如 2005-3_archives）再给一个去掉分卷号的备选
                 m2 = re.match(r"^(\d{4})-\d+_archives$", folders[-1])
                 if m2:
@@ -412,6 +414,10 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                         links.append(f"**[🌐 Open this post on Wayback]({direct})**")
                     links.append(f"[{yr_tag} homepage snapshot]({wb_home})")
                     links.append(f"[Browse all {yr_tag} captures]({wb_calendar})")
+                    if post_urls:
+                        links.append(
+                            f"[All captures of this exact URL](https://web.archive.org/web/*/{post_urls[0]})"
+                        )
                     st.markdown(" · ".join(links))
 
                     # 可选：用官方接口确认该文章是否真的有存档，并显示调试信息
