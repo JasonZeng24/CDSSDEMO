@@ -1,10 +1,12 @@
+import html as htmllib
 import os
 import re
 import sqlite3
-import urllib.parse
 import urllib.request
+
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 # --- 1. 自动从 GitHub Release 缓存下载 DB 文件 ---
 DB_PATH = "weblog_corpus.db"
@@ -45,71 +47,110 @@ VERIFIED_WAYBACK_SNAPSHOTS = {
     "2005": "https://web.archive.org/web/20050701001614/http://www.j-bradford-delong.net/",
 }
 
+# --- HTML 阅读器：正则与样式 ---
+MONTHS = (
+    "January|February|March|April|May|June|July|August|September|October|November|December"
+)
+DATE_RE = re.compile(rf"((?:{MONTHS})\s+\d{{1,2}},\s+\d{{4}})")
+FOOTER_RE = re.compile(
+    r"(Posted by DeLong at\s+[0-9:]+\s*[AP]M\s*\|\s*Permanent Link"
+    r"(?:\s*\|\s*Comments\s*\(\d+\))?(?:\s*\|\s*Trackback\s*\(\d+\))?)",
+    re.IGNORECASE,
+)
+SENT_RE = re.compile(r'(?:(?<=[.!?])|(?<=[.!?]["”]))\s+(?=[A-Z"“])')
 
-def format_post_as_markdown(raw_text: str, search_query: str = "") -> str:
-    """
-    将数据库里粘连在一起的纯文本 (body_clean) 实时重构为结构化分段 Markdown：
-    1. 剥离顶部导航栏噪音 (Semi-Daily Journal ... Website Policies)
-    2. 识别日期行并转换为 Markdown 三级标题 (### 📅 Month DD, YYYY)
-    3. 识别 Posted by DeLong ... 签名栏，转为斜体落款并插入分割线 ---
-    4. 对长文本按句号与引号边界智能分段，并高亮搜索关键词
-    """
+READER_CSS = """
+<style>
+  body { margin:0; padding:24px 32px; background:#fff; color:#1f2937;
+         font-family: Georgia, 'Times New Roman', serif; font-size:17px; line-height:1.75; }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  h3.date { font-family: -apple-system, 'Segoe UI', sans-serif; font-size:13px; letter-spacing:.08em;
+            text-transform:uppercase; color:#003262; border-bottom:2px solid #FDB515;
+            padding-bottom:6px; margin:36px 0 16px; }
+  h3.date:first-child { margin-top:0; }
+  p { margin: 0 0 1.1em; text-align: justify; hyphens: auto; }
+  .sig { font-family: -apple-system, 'Segoe UI', sans-serif; font-size:12px; color:#6b7280;
+         border-left:3px solid #d1d5db; padding-left:10px; margin:18px 0 8px; }
+  mark { background:#fef08a; color:#1e293b; font-weight:600; padding:0 2px; border-radius:2px; }
+  @media (prefers-color-scheme: dark) {
+    body { background:#0e1117; color:#e5e7eb; }
+    h3.date { color:#FDB515; border-color:#374151; }
+    .sig { color:#9ca3af; border-color:#4b5563; }
+  }
+</style>
+"""
+
+
+def _highlight(escaped_text: str, query: str) -> str:
+    """在已转义的文本上高亮关键词，同时跳过 &amp; 之类的 HTML 实体，避免破坏它们。"""
+    if len(query) < 2:
+        return escaped_text
+    q = re.escape(htmllib.escape(query))
+    pattern = re.compile(rf"(&#?\w+;)|({q})", re.IGNORECASE)
+
+    def repl(m):
+        if m.group(1):  # 是实体，原样保留
+            return m.group(1)
+        return f"<mark>{m.group(2)}</mark>"
+
+    return pattern.sub(repl, escaped_text)
+
+
+def _paragraphs(text: str, query: str, sents_per_para: int = 3) -> str:
+    out = []
+    for block in re.split(r"\n\s*\n", text):
+        block = block.strip()
+        if not block:
+            continue
+        sents = SENT_RE.split(block)
+        for i in range(0, len(sents), sents_per_para):
+            chunk = " ".join(sents[i : i + sents_per_para]).strip()
+            if not chunk:
+                continue
+            chunk = _highlight(htmllib.escape(chunk), query)
+            out.append(f"<p>{chunk}</p>")
+    return "\n".join(out)
+
+
+def format_post_as_html(raw_text: str, search_query: str = "") -> str:
+    """把粘连的纯文本重构为完整的、自带样式的 HTML 页面。"""
     if not raw_text:
         return ""
 
-    text = str(raw_text).strip()
+    q = search_query.strip().replace('"', "")
 
-    # 1. 剥离顶部导航栏重复文本
+    # 1. 剥离顶部导航栏噪音
     text = re.sub(
         r"^.*?Website Policies\s*",
         "",
-        text,
+        str(raw_text).strip(),
         count=1,
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    # 2. 将所有日期（如 February 11, 2003）转换为带换行的 Markdown 标题
-    months_pattern = (
-        r"(January|February|March|April|May|June|July|August|September|October|November|December)"
-        r"\s+(\d{1,2},\s+\d{4})"
-    )
-    text = re.sub(
-        months_pattern,
-        r"\n\n---\n\n### 📅 \1 \2\n\n",
-        text,
-    )
+    # 2. 按日期切分：[前言, 日期1, 正文1, 日期2, 正文2, ...]
+    parts = DATE_RE.split(text)
+    html_parts = []
+    if parts[0].strip():
+        html_parts.append(_paragraphs(parts[0], q))
 
-    # 3. 将每篇博文底部的 Posted by DeLong ... Trackback (X) 独立成行并加分割线
-    footer_pattern = (
-        r"(Posted by DeLong at\s+[0-9:]+\s*[AP]M\s*\|\s*Permanent Link"
-        r"(?:\s*\|\s*Comments\s*\(\d+\))?(?:\s*\|\s*Trackback\s*\(\d+\))?)"
+    for i in range(1, len(parts), 2):
+        date = parts[i]
+        body = parts[i + 1] if i + 1 < len(parts) else ""
+        html_parts.append(f'<h3 class="date">📅 {htmllib.escape(date)}</h3>')
+
+        # 3. 按签名栏切开：[正文, 签名, 正文, 签名, ...]
+        segs = FOOTER_RE.split(body)
+        for j, seg in enumerate(segs):
+            if j % 2 == 0:
+                html_parts.append(_paragraphs(seg, q))
+            else:
+                html_parts.append(f'<div class="sig">✍️ {htmllib.escape(seg)}</div>')
+
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        f"{READER_CSS}</head><body><div class='wrap'>{''.join(html_parts)}</div></body></html>"
     )
-    text = re.sub(
-        footer_pattern,
-        r"\n\n> ✍️ *\1*\n\n---\n\n",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    # 4. 智能分段：将粘在一起的长段落在引号对话或每 3-4 个句子处自然换行
-    text = re.sub(r'(\.\")\s+([A-Z\"])', r"\1\n\n\2", text)
-    text = re.sub(r"(\.)\s+(First,|Second,|Third,|Moreover,|In short,|Remember that|To my mind,)", r"\1\n\n\2", text)
-    text = re.sub(r"(MORE\.\.\.)\s+", r"\n\n**\1**\n\n", text)
-
-    # 5. 高亮搜索关键词
-    clean_q = search_query.strip().replace('"', "")
-    if len(clean_q) >= 2:
-        try:
-            text = re.sub(
-                f"({re.escape(clean_q)})",
-                r'<mark style="background-color: #fef08a; font-weight: bold; color: #1e293b;">\1</mark>',
-                text,
-                flags=re.IGNORECASE,
-            )
-        except Exception:
-            pass
-
-    return text.strip()
 
 
 def get_verified_wayback_url(rel_path: str, post_date: str, body_text: str):
@@ -122,7 +163,7 @@ def get_verified_wayback_url(rel_path: str, post_date: str, body_text: str):
     return VERIFIED_WAYBACK_SNAPSHOTS.get(yr, VERIFIED_WAYBACK_SNAPSHOTS["2003"]), yr
 
 
-# --- 2. 侧边栏：强化 DeLong 个人归档与科研项目背景 ---
+# --- 2. 侧边栏 ---
 st.sidebar.title("🏛️ Brad DeLong's Corpus")
 st.sidebar.caption("UC Berkeley Economics | Pre-2005 Archive")
 st.sidebar.markdown(
@@ -168,13 +209,13 @@ nav_mode = st.sidebar.radio(
     ],
 )
 
-# --- 3. 页面 1：强调 DeLong 博客全文检索与正文渲染 ---
+# --- 3. 页面 1：全文检索与 HTML 正文渲染 ---
 if nav_mode == "DeLong Full-Text Search (FTS5)":
     st.title("Search Brad DeLong's Weblog Archive")
     st.markdown(
         "**Explore 21,500+ original posts and economic commentary from Brad"
         " DeLong's *Semi-Daily Journal* (Pre-2005).**  \n*Powered by SQLite FTS5"
-        " & Automated Markdown Content Renderer.*"
+        " & HTML Content Renderer.*"
     )
 
     col1, col2 = st.columns([3, 1])
@@ -230,8 +271,6 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                 raw_body = str(row["body_clean"]).strip() if row["body_clean"] else ""
                 is_local_valid = len(raw_body) > 40
 
-                # 生成结构化分段 Markdown 正文与已验证 Wayback 链接
-                formatted_md = format_post_as_markdown(raw_body, query_text)
                 wb_snap_url, yr_tag = get_verified_wayback_url(
                     row["rel_path"], row["post_date"], raw_body
                 )
@@ -257,10 +296,11 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                         unsafe_allow_html=True,
                     )
 
-                    # Step 1 核心：结构化 Markdown 全文阅读器
-                    with st.expander("📖 Read Full Article (Formatted Markdown View)", expanded=False):
+                    # HTML 全文阅读器（用 toggle 代替嵌套 expander，Streamlit 不允许 expander 嵌套）
+                    if st.toggle("📖 Read Full Article", key=f"read_{row['id']}"):
                         if is_local_valid:
-                            st.markdown(formatted_md, unsafe_allow_html=True)
+                            doc = format_post_as_html(raw_body, query_text)
+                            components.html(doc, height=650, scrolling=True)
                         else:
                             st.warning(
                                 "Local file content is missing or corrupt. Please use the Wayback fallback link below."
@@ -276,7 +316,7 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
             st.error(f"Search query error: {err}")
             conn.close()
 
-# --- 4. 页面 2：DeLong 发帖时间轴趋势 ---
+# --- 4. 页面 2：发帖时间轴趋势 ---
 elif nav_mode == "Posting Timeline & Trends":
     st.title("Brad DeLong's Publishing Timeline")
     st.markdown(
