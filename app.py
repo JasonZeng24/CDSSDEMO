@@ -262,6 +262,66 @@ def format_post_as_html(raw_text: str, search_query: str = "") -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# 时间轴统计：去重 + 只统计单篇文章页
+# ---------------------------------------------------------------------------
+def _entry_key(rel_path):
+    """单篇文章页返回 '规范化文件夹/ID.html'，其他页面（月度/周度/分类/首页变体）返回 None。"""
+    parts = [
+        _clean_component(c)
+        for c in str(rel_path or "").replace("\\", "/").split("/")
+        if c.strip()
+    ]
+    if (
+        len(parts) >= 2
+        and re.fullmatch(r"\d{4,7}\.html?", parts[-1], re.IGNORECASE)
+        and "archives" in parts[-2].lower()
+    ):
+        return f"{parts[-2]}/{parts[-1]}"
+    return None
+
+
+def _norm_title(t):
+    """去掉不同时期模板加的前后缀，便于跨备份副本去重。"""
+    t = str(t or "").strip()
+    t = re.sub(
+        r":?\s*Archive Entry From Brad DeLong[’']s (?:Webjournal|Semi-Daily Journal)\s*$",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(r"^Brad DeLong[’']s Website:\s*", "", t, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", t).strip().lower()
+
+
+@st.cache_data(show_spinner=False)
+def load_timeline_df():
+    conn = get_db_connection()
+    df = pd.read_sql_query(
+        "SELECT rel_path, title, post_date FROM posts "
+        "WHERE post_date IS NOT NULL AND post_date != 'Unknown';",
+        conn,
+    )
+    conn.close()
+
+    cleaned = df["post_date"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+    df["date"] = pd.to_datetime(cleaned, format="%B %d, %Y", errors="coerce")
+    df = df.dropna(subset=["date"])
+    df = df[(df["date"].dt.year >= 1990) & (df["date"].dt.year <= 2029)].copy()
+
+    df["entry_key"] = df["rel_path"].map(_entry_key)
+    df["is_entry"] = df["entry_key"].notna()
+
+    def _dedupe_key(row):
+        nt = _norm_title(row["title"])
+        if nt:
+            return f"{nt}|{row['date'].date()}"
+        return row["entry_key"] or row["rel_path"]
+
+    df["dedupe_key"] = df.apply(_dedupe_key, axis=1)
+    return df
+
+
 # --- 2. 侧边栏 ---
 st.sidebar.title("🏛️ Brad DeLong's Corpus")
 st.sidebar.caption("UC Berkeley Economics | Pre-2005 Archive")
@@ -453,29 +513,64 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
 elif nav_mode == "Posting Timeline & Trends":
     st.title("Brad DeLong's Publishing Timeline")
     st.markdown(
-        "*Annual volume of posts and notes published across the pre-2005"
-        " archive.*"
+        "*Volume of posts published across the pre-2005 archive, by date.*"
     )
 
-    conn = get_db_connection()
-    yearly_sql = """
-    SELECT 
-        substr(post_date, -4) AS year, 
-        COUNT(*) AS post_count
-    FROM posts
-    WHERE post_date != 'Unknown' 
-      AND substr(post_date, -4) GLOB '19[89][0-9]|20[0-2][0-9]'
-    GROUP BY year
-    ORDER BY year ASC;
-    """
-    df_years = pd.read_sql_query(yearly_sql, conn)
-    conn.close()
+    try:
+        tl = load_timeline_df()
+    except Exception as e:
+        st.error(f"Timeline error: {e}")
+        tl = None
 
-    if not df_years.empty:
-        st.bar_chart(data=df_years.set_index("year"), color="#003262")
-        st.dataframe(df_years, use_container_width=True)
+    if tl is None or tl.empty:
+        st.info("No timeline data available.")
     else:
-        st.info("No yearly timeline data available.")
+        c1, c2 = st.columns(2)
+        with c1:
+            count_mode = st.radio(
+                "Count",
+                ["Unique posts (deduplicated)", "All dated records"],
+                horizontal=True,
+            )
+        with c2:
+            gran = st.radio("Granularity", ["By year", "By month"], horizontal=True)
+
+        if count_mode.startswith("Unique"):
+            d = tl[tl["is_entry"]].drop_duplicates("dedupe_key")
+            st.caption(
+                "Only single-entry pages are counted, and copies of the same post "
+                "across backup folders are merged. Monthly, weekly, category and "
+                "index pages are excluded."
+            )
+        else:
+            d = tl
+            st.caption(
+                "Every record with a valid date, including aggregator pages and "
+                "duplicate backup copies, so totals will be inflated."
+            )
+
+        if d.empty:
+            st.info("No records match this view.")
+        else:
+            if gran == "By year":
+                counts = d["date"].dt.year.value_counts().sort_index()
+                label = "year"
+                index = counts.index.astype(str)
+            else:
+                counts = d["date"].dt.to_period("M").astype(str).value_counts().sort_index()
+                label = "month"
+                index = counts.index
+
+            chart_df = pd.DataFrame({"post_count": counts.values}, index=index)
+            chart_df.index.name = label
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Posts counted", f"{len(d):,}")
+            m2.metric("Earliest", d["date"].min().strftime("%b %d, %Y"))
+            m3.metric("Latest", d["date"].max().strftime("%b %d, %Y"))
+
+            st.bar_chart(chart_df, color="#003262")
+            st.dataframe(chart_df.reset_index(), use_container_width=True)
 
 # --- 5. 页面 3：媒体依赖审计 ---
 elif nav_mode == "Resource Health Audit":
