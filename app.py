@@ -3,13 +3,13 @@ import re
 import sqlite3
 import urllib.parse
 import urllib.request
+import json
 import pandas as pd
 import streamlit as st
 
 # --- 1. 自动从 GitHub Release 缓存下载 DB 文件 ---
 DB_PATH = "weblog_corpus.db"
 RELEASE_URL = "https://github.com/JasonZeng24/CDSSDEMO/releases/download/v1.0/weblog_corpus.db"
-HISTORICAL_BASE_URL = "http://www.j-bradford-delong.net/movable_type/"
 
 st.set_page_config(
     page_title="Brad DeLong's Weblog Archive (1995–2005)",
@@ -34,6 +34,92 @@ ensure_database()
 
 def get_db_connection():
     return sqlite3.connect(DB_PATH)
+
+
+# 月份英文名转两位数字映射表
+MONTH_MAP = {
+    "january": "01", "february": "02", "march": "03", "april": "04",
+    "may": "05", "june": "06", "july": "07", "august": "08",
+    "september": "09", "october": "10", "november": "11", "december": "12"
+}
+
+
+@st.cache_data(show_spinner=False)
+def resolve_wayback_url(rel_path: str, post_date: str) -> str:
+    """
+    将本地自定义 rel_path 还原为当年 j-bradford-delong.net 上的具体文章/归档页 URL，
+    并通过 Wayback CDX API 查找最匹配的真实快照页面。
+    """
+    clean_p = str(rel_path).replace("\\", "/").lstrip("/")
+    
+    # 剔除本地外层文件夹前缀（如果有）
+    for prefix in ["web_assets_cleaned/", "delong_archive/", "archive/"]:
+        if clean_p.startswith(prefix):
+            clean_p = clean_p[len(prefix):]
+
+    candidates = []
+
+    # 1. 处理类似 '2003_archives--July' 的月度归档文件名
+    m_month = re.search(r"(\d{4})_archives(?:--|/|-)?([A-Za-z]+)", clean_p)
+    if m_month:
+        yr, m_name = m_month.group(1), m_month.group(2).lower()
+        if m_name in MONTH_MAP:
+            mm = MONTH_MAP[m_name]
+            # Movable Type 当年真实的月度归档 URL 格式
+            candidates.append(f"http://www.j-bradford-delong.net/movable_type/{yr}_archives/{yr}_{mm}.html")
+            candidates.append(f"http://www.j-bradford-delong.net/movable_type/archives/{yr}_{mm}.html")
+
+    # 2. 处理将 '--' 转回 '/' 后的原始相对路径
+    restored_path = clean_p.replace("--", "/")
+    if restored_path.startswith("movable_type/"):
+        sub_p = restored_path[len("movable_type/"):]
+    else:
+        sub_p = restored_path
+
+    # 候选路径：带 movable_type 和直接挂在根域名下的具体页面
+    candidates.append(f"http://www.j-bradford-delong.net/movable_type/{sub_p}")
+    candidates.append(f"http://www.j-bradford-delong.net/{sub_p}")
+    if not sub_p.endswith(".html") and not sub_p.endswith(".htm"):
+        candidates.append(f"http://www.j-bradford-delong.net/movable_type/{sub_p}.html")
+        candidates.append(f"http://www.j-bradford-delong.net/{sub_p}.html")
+
+    # 3. 依次通过 Wayback CDX API 检查哪个候选具体页面真实存在快照
+    for cand_url in candidates:
+        cdx_api = (
+            f"https://web.archive.org/cdx/search/cdx?"
+            f"url={urllib.parse.quote(cand_url)}&output=json&fl=timestamp,original&filter=statuscode:200&limit=1"
+        )
+        try:
+            req = urllib.request.Request(cdx_api, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if len(data) > 1:  # data[0] 是表头 ['timestamp', 'original']
+                    ts, orig = data[1][0], data[1][1]
+                    return f"https://web.archive.org/web/{ts}/{orig}"
+        except Exception:
+            pass
+
+    # 4. 如果精确文件名因当年重命名找不到，用文件前缀模糊搜索 CDX 目录下的最近页面
+    base_slug = os.path.splitext(os.path.basename(restored_path))[0]
+    if len(base_slug) >= 4:
+        cdx_prefix_api = (
+            f"https://web.archive.org/cdx/search/cdx?"
+            f"url=j-bradford-delong.net/*{urllib.parse.quote(base_slug)}*&output=json&fl=timestamp,original&filter=statuscode:200&limit=1"
+        )
+        try:
+            req = urllib.request.Request(cdx_prefix_api, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if len(data) > 1:
+                    ts, orig = data[1][0], data[1][1]
+                    return f"https://web.archive.org/web/{ts}/{orig}"
+        except Exception:
+            pass
+
+    # 5. 最终保底：跳到该文章所属年份/日期的具体时间轴快照
+    m_yr = re.search(r"(199\d|200[0-5])", clean_p + " " + str(post_date))
+    yr = m_yr.group(1) if m_yr else "2004"
+    return f"https://web.archive.org/web/{yr}0710015200/http://www.j-bradford-delong.net/"
 
 
 # --- 2. 侧边栏：强化 DeLong 个人归档与科研项目背景 ---
@@ -141,26 +227,8 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                     else f"Missing {row['missing_imgs']} Images"
                 )
 
-                # --- 智能生成绝对不会报“未收录”的 Wayback 链接 ---
-                clean_path = str(row["rel_path"]).replace("\\", "/").lstrip("/")
-
-                # 情况 1：检查是不是标准的 6 位数字文章 HTML (如 2003_archives/001447.html)
-                match_id = re.search(r"(200\d_archives/\d{6}\.html)", clean_path)
-                # 情况 2：检查路径或日期里有没有具体年份 (如 2003)
-                match_year = re.search(
-                    r"(199\d|200[0-5])", clean_path + " " + str(row["post_date"])
-                )
-
-                if match_id:
-                    # 标准 Movable Type 博文路径，定位到该文章快照
-                    wayback_url = f"https://web.archive.org/web/20040710015200/http://www.j-bradford-delong.net/movable_type/{match_id.group(1)}"
-                elif match_year:
-                    # 本地自定义文件名（如 2003_archives--July），直接跳到该年份被证实存在的博客主站快照！
-                    yr = match_year.group(1)
-                    wayback_url = f"https://web.archive.org/web/{yr}0710015200/http://www.j-bradford-delong.net/"
-                else:
-                    # 兜底：跳到 2004 年 7 月 10 日最完整的历史首页快照
-                    wayback_url = "https://web.archive.org/web/20040710015200/http://www.j-bradford-delong.net/"
+                # 解析该条文章在 Wayback Machine 上的真实快照地址
+                wayback_url = resolve_wayback_url(row["rel_path"], row["post_date"])
 
                 with st.expander(
                     f"📝 {post_title} ({row['post_date']})", expanded=True
