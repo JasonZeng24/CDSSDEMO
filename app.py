@@ -40,6 +40,7 @@ def get_db_connection():
     return sqlite3.connect(DB_PATH)
 
 
+
 # ---------------------------------------------------------------------------
 # Wayback 相关
 # 原站文章真实 URL 格式：
@@ -58,14 +59,22 @@ VERIFIED_WAYBACK_SNAPSHOTS = {
 }
 
 
+def _clean_component(c: str) -> str:
+    """去掉本地备份目录的后缀：'archives--July 1 2003'、'2004_archives_copy'、'movable_type copy' 等。"""
+    c = re.sub(r"--.*$", "", c)
+    c = re.sub(r"[ _]copy( \d+)?$", "", c, flags=re.IGNORECASE)
+    return c.strip()
+
+
 def get_wayback_info(rel_path: str, post_date: str, body_text: str):
     """
     返回 (年份首页快照, 年份, 时间戳, 候选原站URL列表, 年份日历页)
+    原站单篇文章 URL 格式：movable_type/{文件夹}/{文章ID}.html
     """
     rel = str(rel_path or "").replace("\\", "/").strip()
     pdate = str(post_date or "").strip()
 
-    # 年份 + 精确日期（用于让 Wayback 找最接近的快照）
+    # 年份 + 精确日期（让 Wayback 找离发帖日最近的快照）
     dt = None
     try:
         dt = datetime.strptime(pdate, "%B %d, %Y")
@@ -80,16 +89,24 @@ def get_wayback_info(rel_path: str, post_date: str, body_text: str):
         yr = m_yr.group(1) if m_yr else "2003"
         ts = f"{yr}0701"
 
-    # 候选原站 URL
+    # 候选路径
+    parts = [_clean_component(c) for c in rel.split("/") if c.strip()]
     paths = []
-    # 情况 1：rel_path 本身就含 movable_type/... 完整路径
-    m = re.search(r"(movable_type/.+?\.html?)$", rel, re.IGNORECASE)
-    if m:
-        paths.append(m.group(1))
-    # 情况 2：从文件名里取文章 ID，按年份重建
-    m = re.search(r"(\d{4,7})\.html?$", rel, re.IGNORECASE)
-    if m:
-        paths.append(f"movable_type/{yr}_archives/{m.group(1)}.html")
+    if parts:
+        fname, folders = parts[-1], parts[:-1]
+        m = re.fullmatch(r"(\d{4,7})\.html?", fname, re.IGNORECASE)
+        if m and folders and "archives" in folders[-1].lower():
+            # 单篇文章页：movable_type/{文件夹}/{ID}.html
+            folder = folders[-1]
+            names = [folder]
+            m2 = re.match(r"^(\d{4})-\d+_archives$", folder)  # 如 2005-3_archives
+            if m2:
+                names.append(f"{m2.group(1)}_archives")  # 备选：去掉分卷号
+            for n in names:
+                paths.append(f"movable_type/{quote(n)}/{m.group(1)}.html")
+        else:
+            # 非文章页（首页变体、OpEd 等）：按本地路径原样尝试
+            paths.append("/".join(quote(c) for c in parts))
 
     urls = []
     for p in paths:
