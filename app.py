@@ -7,6 +7,8 @@ import urllib.request
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+import json
+from urllib.parse import quote
 
 # --- 1. 自动从 GitHub Release 缓存下载 DB 文件 ---
 DB_PATH = "weblog_corpus.db"
@@ -153,14 +155,39 @@ def format_post_as_html(raw_text: str, search_query: str = "") -> str:
     )
 
 
+SITE = "http://www.j-bradford-delong.net/"
+
+
 def get_verified_wayback_url(rel_path: str, post_date: str, body_text: str):
-    """
-    提取文章年份并返回 100% 经过验证可正常加载的历史快照链接。
-    """
+    """返回 (年份首页快照, 年份, 文章原始URL猜测, 年份日历页)"""
     combined = f"{rel_path} {post_date} {body_text[:400]}"
     m_yr = re.search(r"(200[0-5])", combined)
     yr = m_yr.group(1) if m_yr else "2003"
-    return VERIFIED_WAYBACK_SNAPSHOTS.get(yr, VERIFIED_WAYBACK_SNAPSHOTS["2003"]), yr
+    home = VERIFIED_WAYBACK_SNAPSHOTS.get(yr, VERIFIED_WAYBACK_SNAPSHOTS["2003"])
+    path = str(rel_path or "").replace("\\", "/").lstrip("./")
+    post_url = SITE + quote(path) if path else ""
+    calendar = f"https://web.archive.org/web/{yr}*/{SITE}*"
+    return home, yr, post_url, calendar
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def find_closest_snapshot(url: str, yr: str):
+    """查询 Wayback 官方接口，返回最近的真实快照链接，查不到返回 None。"""
+    if not url:
+        return None
+    try:
+        api = (
+            "https://archive.org/wayback/available?url="
+            f"{quote(url, safe='')}&timestamp={yr}0701"
+        )
+        with urllib.request.urlopen(api, timeout=8) as r:
+            data = json.load(r)
+        snap = data.get("archived_snapshots", {}).get("closest")
+        if snap and snap.get("available"):
+            return snap["url"].replace("http://", "https://", 1)
+    except Exception:
+        pass
+    return None
 
 
 # --- 2. 侧边栏 ---
@@ -271,7 +298,7 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                 raw_body = str(row["body_clean"]).strip() if row["body_clean"] else ""
                 is_local_valid = len(raw_body) > 40
 
-                wb_snap_url, yr_tag = get_verified_wayback_url(
+                wb_home, yr_tag, post_orig_url, wb_calendar = get_verified_wayback_url(
                     row["rel_path"], row["post_date"], raw_body
                 )
 
@@ -308,8 +335,18 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
 
                     # 底部 Wayback Machine 跳转栏
                     st.divider()
+                    if st.button("🔎 Find closest Wayback snapshot of this post", key=f"wb_{row['id']}"):
+                        hit = find_closest_snapshot(post_orig_url, yr_tag)
+                        if hit:
+                            st.markdown(f"✅ **[Open this post's snapshot]({hit})**")
+                        else:
+                            st.info(
+                                "No snapshot of this exact page was found. "
+                                "Try the year homepage or calendar below."
+                            )
                     st.markdown(
-                        f"🌐 **[Sourced from Wayback ({yr_tag} Historical Snapshot)]({wb_snap_url})**"
+                        f"🌐 [{yr_tag} homepage snapshot]({wb_home}) · "
+                        f"[Browse all {yr_tag} captures]({wb_calendar})"
                     )
 
         except Exception as err:
