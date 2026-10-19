@@ -8,16 +8,7 @@ import streamlit as st
 # --- 1. 自动从 GitHub Release 缓存下载 DB 文件 ---
 DB_PATH = "weblog_corpus.db"
 RELEASE_URL = "https://github.com/JasonZeng24/CDSSDEMO/releases/download/v1.0/weblog_corpus.db"
-# 确保基准前缀包含 movable_type/
 HISTORICAL_BASE_URL = "http://www.j-bradford-delong.net/movable_type/"
-
-# 拼接时剥离可能重复的路径前缀
-clean_path = str(row["rel_path"]).replace("\\", "/").lstrip("/")
-if clean_path.startswith("movable_type/"):
-  clean_path = clean_path[len("movable_type/") :]
-
-original_url = urllib.parse.urljoin(HISTORICAL_BASE_URL, clean_path)
-wayback_url = f"https://web.archive.org/web/*/{original_url}"
 
 st.set_page_config(
     page_title="Brad DeLong's Weblog Archive (1995–2005)",
@@ -149,9 +140,12 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
             else f"Missing {row['missing_imgs']} Images"
         )
 
-        # 构造原始归档完整 URL 与 Wayback Machine 回退查阅直链
-        clean_rel_path = str(row["rel_path"]).lstrip("/")
-        original_url = urllib.parse.urljoin(HISTORICAL_BASE_URL, clean_rel_path)
+        # 路径清理与 URL 拼接：必须放置在 for 循环内部执行
+        clean_path = str(row["rel_path"]).replace("\\", "/").lstrip("/")
+        if clean_path.startswith("movable_type/"):
+          clean_path = clean_path[len("movable_type/") :]
+
+        original_url = urllib.parse.urljoin(HISTORICAL_BASE_URL, clean_path)
         wayback_url = f"https://web.archive.org/web/*/{original_url}"
 
         with st.expander(
@@ -164,7 +158,7 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
 
           # Step 1 核心功能：全文可折叠渲染
           with st.expander("📖 Read Full Article (Cleaned Text)"):
-            if row["body_clean"] and row["body_clean"].strip():
+            if row["body_clean"] and str(row["body_clean"]).strip():
               st.markdown(row["body_clean"])
             else:
               st.info(
@@ -222,7 +216,7 @@ elif nav_mode == "Resource Health Audit":
   st.title("Asset & Dependency Health Audit")
   st.markdown(
       "*Audit of archived DeLong posts with missing external images or broken"
-      " legacy paths (494 files flagged).*[cite: 1]"
+      " legacy paths (494 files flagged).*"
   )
 
   conn = get_db_connection()
