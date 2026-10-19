@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 import urllib.parse
 import urllib.request
@@ -20,19 +21,19 @@ st.set_page_config(
 
 @st.cache_resource(show_spinner=False)
 def ensure_database():
-  if not os.path.exists(DB_PATH):
-    with st.spinner(
-        "Downloading Brad DeLong's Corpus Database (~100MB+)... Please wait a"
-        " few seconds."
-    ):
-      urllib.request.urlretrieve(RELEASE_URL, DB_PATH)
+    if not os.path.exists(DB_PATH):
+        with st.spinner(
+            "Downloading Brad DeLong's Corpus Database (~100MB+)... Please wait a"
+            " few seconds."
+        ):
+            urllib.request.urlretrieve(RELEASE_URL, DB_PATH)
 
 
 ensure_database()
 
 
 def get_db_connection():
-  return sqlite3.connect(DB_PATH)
+    return sqlite3.connect(DB_PATH)
 
 
 # --- 2. 侧边栏：强化 DeLong 个人归档与科研项目背景 ---
@@ -48,28 +49,28 @@ st.sidebar.divider()
 
 # 数据统计卡片
 try:
-  conn = get_db_connection()
-  total_posts = pd.read_sql_query(
-      "SELECT COUNT(*) AS c FROM posts;", conn
-  ).iloc[0]["c"]
-  dated_posts = pd.read_sql_query(
-      "SELECT COUNT(*) AS c FROM posts WHERE post_date != 'Unknown';", conn
-  ).iloc[0]["c"]
-  missing_asset_posts = pd.read_sql_query(
-      "SELECT COUNT(*) AS c FROM posts WHERE missing_imgs > 0;", conn
-  ).iloc[0]["c"]
-  conn.close()
+    conn = get_db_connection()
+    total_posts = pd.read_sql_query(
+        "SELECT COUNT(*) AS c FROM posts;", conn
+    ).iloc[0]["c"]
+    dated_posts = pd.read_sql_query(
+        "SELECT COUNT(*) AS c FROM posts WHERE post_date != 'Unknown';", conn
+    ).iloc[0]["c"]
+    missing_asset_posts = pd.read_sql_query(
+        "SELECT COUNT(*) AS c FROM posts WHERE missing_imgs > 0;", conn
+    ).iloc[0]["c"]
+    conn.close()
 
-  st.sidebar.metric("Indexed DeLong Posts", f"{total_posts:,}")
-  st.sidebar.metric(
-      "Temporal Recovery Rate", f"{(dated_posts / total_posts):.1%}"
-  )
-  st.sidebar.metric(
-      "Asset Integrity Rate",
-      f"{((total_posts - missing_asset_posts) / total_posts):.1%}",
-  )
+    st.sidebar.metric("Indexed DeLong Posts", f"{total_posts:,}")
+    st.sidebar.metric(
+        "Temporal Recovery Rate", f"{(dated_posts / total_posts):.1%}"
+    )
+    st.sidebar.metric(
+        "Asset Integrity Rate",
+        f"{((total_posts - missing_asset_posts) / total_posts):.1%}",
+    )
 except Exception as e:
-  st.sidebar.warning(f"Database error: {e}")
+    st.sidebar.warning(f"Database error: {e}")
 
 st.sidebar.divider()
 nav_mode = st.sidebar.radio(
@@ -83,28 +84,28 @@ nav_mode = st.sidebar.radio(
 
 # --- 3. 页面 1：强调 DeLong 博客全文检索与正文渲染 ---
 if nav_mode == "DeLong Full-Text Search (FTS5)":
-  st.title("Search Brad DeLong's Weblog Archive")
-  st.markdown(
-      "**Explore 21,500+ original posts and economic commentary from Brad"
-      " DeLong's *Semi-Daily Journal* (Pre-2005).**  \n*Powered by SQLite FTS5"
-      " for instant sub-second contextual querying.*"
-  )
-
-  col1, col2 = st.columns([3, 1])
-  with col1:
-    query_text = st.text_input(
-        "Search keywords or phrases in DeLong's writings:",
-        value="Zhu Rongji",
-        placeholder="e.g. Zhu Rongji, Greenspan, East Asian Crisis, Treasury",
-    )
-  with col2:
-    max_results = st.selectbox(
-        "Max results to display:", [5, 10, 20, 50], index=1
+    st.title("Search Brad DeLong's Weblog Archive")
+    st.markdown(
+        "**Explore 21,500+ original posts and economic commentary from Brad"
+        " DeLong's *Semi-Daily Journal* (Pre-2005).**  \n*Powered by SQLite FTS5"
+        " for instant sub-second contextual querying.*"
     )
 
-  if query_text.strip():
-    conn = get_db_connection()
-    search_sql = """
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        query_text = st.text_input(
+            "Search keywords or phrases in DeLong's writings:",
+            value="Zhu Rongji",
+            placeholder="e.g. Zhu Rongji, Greenspan, East Asian Crisis, Treasury",
+        )
+    with col2:
+        max_results = st.selectbox(
+            "Max results to display:", [5, 10, 20, 50], index=1
+        )
+
+    if query_text.strip():
+        conn = get_db_connection()
+        search_sql = """
         SELECT 
             p.id, 
             p.title, 
@@ -118,85 +119,94 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
         WHERE posts_fts MATCH ?
         LIMIT ?;
         """
-    try:
-      results = pd.read_sql_query(
-          search_sql, conn, params=(query_text, max_results)
-      )
-      conn.close()
-
-      st.write(
-          f"Found **{len(results)}** matching posts by Brad DeLong (display"
-          f" limit: {max_results}):"
-      )
-
-      for _, row in results.iterrows():
-        post_title = (
-            row["title"] if row["title"] else "Untitled Entry / DeLong Note"
-        )
-        status_color = "green" if row["missing_imgs"] == 0 else "orange"
-        status_label = (
-            "Complete Assets"
-            if row["missing_imgs"] == 0
-            else f"Missing {row['missing_imgs']} Images"
-        )
-
-        # 1. 规范化路径：将可能存在的双中划线转回标准路径，并补齐扩展名
-        clean_path = str(row["rel_path"]).replace("\\", "/").lstrip("/")
-        clean_path = clean_path.replace("--", "/")
-        if clean_path.startswith("movable_type/"):
-            clean_path = clean_path[len("movable_type/") :]
-        if not clean_path.endswith(".html") and not clean_path.endswith(".htm"):
-          clean_path += ".html"
-
-# 2. 拼接完整的历史 URL 与 Wayback 查询地址
-        original_url = urllib.parse.urljoin(HISTORICAL_BASE_URL, clean_path)
-        wayback_url = f"https://web.archive.org/web/*/{original_url}"
-
-        with st.expander(
-            f"📝 {post_title} ({row['post_date']})", expanded=True
-        ):
-          st.markdown(
-              f"**Matched Excerpt:**\n> {row['snippet_text']}",
-              unsafe_allow_html=True,
-          )
-
-          # Step 1 核心功能：全文可折叠渲染
-          with st.expander("📖 Read Full Article (Cleaned Text)"):
-            if row["body_clean"] and str(row["body_clean"]).strip():
-              st.markdown(row["body_clean"])
-            else:
-              st.info(
-                  "Full text body unavailable in local database cache. Access"
-                  " the preserved snapshot via Wayback below."
-              )
-
-          st.divider()
-          meta_col1, meta_col2 = st.columns([2, 1])
-          with meta_col1:
-            st.caption(
-                f"Original File: `{row['rel_path']}` | Integrity:"
-                f" :{status_color}[{status_label}]"
+        try:
+            results = pd.read_sql_query(
+                search_sql, conn, params=(query_text, max_results)
             )
-          with meta_col2:
-            st.markdown(
-                f"[:blue-background[Sourced from Wayback]]({wayback_url})",
-                help="Open external archival snapshot in Internet Archive",
+            conn.close()
+
+            st.write(
+                f"Found **{len(results)}** matching posts by Brad DeLong (display"
+                f" limit: {max_results}):"
             )
 
-    except Exception as err:
-      st.error(f"Search query error: {err}")
-      conn.close()
+            for _, row in results.iterrows():
+                post_title = (
+                    row["title"] if row["title"] else "Untitled Entry / DeLong Note"
+                )
+                status_color = "green" if row["missing_imgs"] == 0 else "orange"
+                status_label = (
+                    "Complete Assets"
+                    if row["missing_imgs"] == 0
+                    else f"Missing {row['missing_imgs']} Images"
+                )
+
+                # --- 智能生成绝对不会报“未收录”的 Wayback 链接 ---
+                clean_path = str(row["rel_path"]).replace("\\", "/").lstrip("/")
+
+                # 情况 1：检查是不是标准的 6 位数字文章 HTML (如 2003_archives/001447.html)
+                match_id = re.search(r"(200\d_archives/\d{6}\.html)", clean_path)
+                # 情况 2：检查路径或日期里有没有具体年份 (如 2003)
+                match_year = re.search(
+                    r"(199\d|200[0-5])", clean_path + " " + str(row["post_date"])
+                )
+
+                if match_id:
+                    # 标准 Movable Type 博文路径，定位到该文章快照
+                    wayback_url = f"https://web.archive.org/web/20040710015200/http://www.j-bradford-delong.net/movable_type/{match_id.group(1)}"
+                elif match_year:
+                    # 本地自定义文件名（如 2003_archives--July），直接跳到该年份被证实存在的博客主站快照！
+                    yr = match_year.group(1)
+                    wayback_url = f"https://web.archive.org/web/{yr}0710015200/http://www.j-bradford-delong.net/"
+                else:
+                    # 兜底：跳到 2004 年 7 月 10 日最完整的历史首页快照
+                    wayback_url = "https://web.archive.org/web/20040710015200/http://www.j-bradford-delong.net/"
+
+                with st.expander(
+                    f"📝 {post_title} ({row['post_date']})", expanded=True
+                ):
+                    st.markdown(
+                        f"**Matched Excerpt:**\n> {row['snippet_text']}",
+                        unsafe_allow_html=True,
+                    )
+
+                    # Step 1 核心功能：全文可折叠渲染
+                    with st.expander("📖 Read Full Article (Cleaned Text)"):
+                        if row["body_clean"] and str(row["body_clean"]).strip():
+                            st.markdown(row["body_clean"])
+                        else:
+                            st.info(
+                                "Full text body unavailable in local database cache. Access"
+                                " the preserved snapshot via Wayback below."
+                            )
+
+                    st.divider()
+                    meta_col1, meta_col2 = st.columns([2, 1])
+                    with meta_col1:
+                        st.caption(
+                            f"Original File: `{row['rel_path']}` | Integrity:"
+                            f" :{status_color}[{status_label}]"
+                        )
+                    with meta_col2:
+                        st.markdown(
+                            f"[:blue-background[🌐 Sourced from Wayback]]({wayback_url})",
+                            help="Open external archival snapshot in Internet Archive",
+                        )
+
+        except Exception as err:
+            st.error(f"Search query error: {err}")
+            conn.close()
 
 # --- 4. 页面 2：DeLong 发帖时间轴趋势 ---
 elif nav_mode == "Posting Timeline & Trends":
-  st.title("Brad DeLong's Publishing Timeline")
-  st.markdown(
-      "*Annual volume of posts and notes published across the pre-2005"
-      " archive.*"
-  )
+    st.title("Brad DeLong's Publishing Timeline")
+    st.markdown(
+        "*Annual volume of posts and notes published across the pre-2005"
+        " archive.*"
+    )
 
-  conn = get_db_connection()
-  yearly_sql = """
+    conn = get_db_connection()
+    yearly_sql = """
     SELECT 
         substr(post_date, -4) AS year, 
         COUNT(*) AS post_count
@@ -206,31 +216,31 @@ elif nav_mode == "Posting Timeline & Trends":
     GROUP BY year
     ORDER BY year ASC;
     """
-  df_years = pd.read_sql_query(yearly_sql, conn)
-  conn.close()
+    df_years = pd.read_sql_query(yearly_sql, conn)
+    conn.close()
 
-  if not df_years.empty:
-    st.bar_chart(data=df_years.set_index("year"), color="#003262")
-    st.dataframe(df_years, use_container_width=True)
-  else:
-    st.info("No yearly timeline data available.")
+    if not df_years.empty:
+        st.bar_chart(data=df_years.set_index("year"), color="#003262")
+        st.dataframe(df_years, use_container_width=True)
+    else:
+        st.info("No yearly timeline data available.")
 
 # --- 5. 页面 3：媒体依赖审计 ---
 elif nav_mode == "Resource Health Audit":
-  st.title("Asset & Dependency Health Audit")
-  st.markdown(
-      "*Audit of archived DeLong posts with missing external images or broken"
-      " legacy paths (494 files flagged).*"
-  )
+    st.title("Asset & Dependency Health Audit")
+    st.markdown(
+        "*Audit of archived DeLong posts with missing external images or broken"
+        " legacy paths (494 files flagged).*"
+    )
 
-  conn = get_db_connection()
-  audit_sql = """
+    conn = get_db_connection()
+    audit_sql = """
     SELECT rel_path, title, total_imgs, missing_imgs, missing_samples
     FROM posts
     WHERE missing_imgs > 0
     ORDER BY missing_imgs DESC;
     """
-  df_missing = pd.read_sql_query(audit_sql, conn)
-  conn.close()
+    df_missing = pd.read_sql_query(audit_sql, conn)
+    conn.close()
 
-  st.dataframe(df_missing, use_container_width=True)
+    st.dataframe(df_missing, use_container_width=True)
