@@ -105,8 +105,19 @@ def get_wayback_info(rel_path: str, post_date: str, body_text: str):
             for n in names:
                 paths.append(f"movable_type/{quote(n)}/{m.group(1)}.html")
         else:
-            # 非文章页（首页变体、OpEd 等）：按本地路径原样尝试
-            paths.append("/".join(quote(c) for c in parts))
+            # 非文章页（分类页 cat_*.html、首页变体、OpEd 等）
+            in_archives = any("archives" in f.lower() for f in folders)
+            if in_archives and folders[0].lower() != "movable_type":
+                # 本地目录丢掉了 movable_type/ 这一层，补回去
+                prefixed = ["movable_type"] + parts
+                paths.append("/".join(quote(c) for c in prefixed))
+                # 分卷目录（如 2005-3_archives）再给一个去掉分卷号的备选
+                m2 = re.match(r"^(\d{4})-\d+_archives$", folders[-1])
+                if m2:
+                    alt = ["movable_type"] + parts[:-2] + [f"{m2.group(1)}_archives", fname]
+                    paths.append("/".join(quote(c) for c in alt))
+            else:
+                paths.append("/".join(quote(c) for c in parts))
 
     urls = []
     for p in paths:
