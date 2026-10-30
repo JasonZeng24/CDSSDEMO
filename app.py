@@ -40,6 +40,26 @@ def get_db_connection():
     return sqlite3.connect(DB_PATH)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_recovered_assets(post_id: int):
+    """Return a list of (orig_path, wayback_url) with hit status for the given post."""
+    conn = get_db_connection()
+    try:
+        has = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='missing_assets'"
+        ).fetchone()
+        if not has:
+            return []
+        rows = conn.execute(
+            "SELECT orig_path, wayback_url FROM missing_assets "
+            "WHERE post_id = ? AND status = 'hit' AND wayback_url IS NOT NULL",
+            (post_id,),
+        ).fetchall()
+        return rows
+    finally:
+        conn.close()
+
+
 
 # ---------------------------------------------------------------------------
 # Wayback 相关
@@ -465,6 +485,26 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                                 "Local file content is missing or corrupt. Please use the Wayback link below."
                             )
 
+                    # Recovered images gallery (from missing_assets lookup)
+                    recovered = get_recovered_assets(int(row["id"]))
+                    if recovered:
+                        st.markdown(
+                            f"**🖼️ Recovered figures ({len(recovered)}) — fetched from Wayback:**"
+                        )
+                        img_cols = st.columns(min(len(recovered), 3))
+                        for idx, (orig_path, wb_url) in enumerate(recovered[:6]):
+                            with img_cols[idx % len(img_cols)]:
+                                # Use Wayback's "if_" raw mode so the image loads without the toolbar frame
+                                raw_wb = re.sub(
+                                    r"/web/(\d+)/", r"/web/\1if_/", wb_url, count=1
+                                )
+                                try:
+                                    st.image(raw_wb, caption=orig_path.split("/")[-1], use_container_width=True)
+                                except Exception:
+                                    st.markdown(f"[{orig_path.split('/')[-1]}]({wb_url})")
+                        if len(recovered) > 6:
+                            st.caption(f"...and {len(recovered) - 6} more recovered figures")
+
                     # Wayback 链接
                     st.divider()
                     links = []
@@ -572,22 +612,136 @@ elif nav_mode == "Posting Timeline & Trends":
             st.bar_chart(chart_df, color="#003262")
             st.dataframe(chart_df.reset_index(), use_container_width=True)
 
-# --- 5. 页面 3：媒体依赖审计 ---
+# --- 5. 页面 3：Asset Recovery (missing-asset classification + Wayback recovery) ---
 elif nav_mode == "Resource Health Audit":
-    st.title("Asset & Dependency Health Audit")
+    st.title("Asset Recovery & Health Audit")
     st.markdown(
-        "*Audit of archived DeLong posts with missing external images or broken"
-        " legacy paths (494 files flagged).*"
+        "*494 posts referenced images we couldn't bundle locally. We triaged every"
+        " missing path into **chart / chrome / desktop / other** and queried the"
+        " Wayback Machine to see which of DeLong's own figures can be rendered"
+        " back into the article view.*"
     )
 
     conn = get_db_connection()
-    audit_sql = """
-    SELECT rel_path, title, total_imgs, missing_imgs, missing_samples
-    FROM posts
-    WHERE missing_imgs > 0
-    ORDER BY missing_imgs DESC;
-    """
-    df_missing = pd.read_sql_query(audit_sql, conn)
-    conn.close()
+    has_recovery = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='missing_assets'"
+    ).fetchone() is not None
 
-    st.dataframe(df_missing, use_container_width=True)
+    if not has_recovery:
+        st.warning(
+            "`missing_assets` table not found. Run `python scripts/classify_missing.py`"
+            " then `python scripts/wayback_recover.py` to populate it."
+        )
+        st.dataframe(
+            pd.read_sql_query(
+                "SELECT rel_path, title, total_imgs, missing_imgs, missing_samples "
+                "FROM posts WHERE missing_imgs > 0 ORDER BY missing_imgs DESC;",
+                conn,
+            ),
+            use_container_width=True,
+        )
+        conn.close()
+    else:
+        kind_counts = pd.read_sql_query(
+            "SELECT kind, COUNT(*) AS n FROM missing_assets GROUP BY kind ORDER BY n DESC;",
+            conn,
+        )
+        status_counts = pd.read_sql_query(
+            "SELECT status, COUNT(*) AS n FROM missing_assets GROUP BY status ORDER BY n DESC;",
+            conn,
+        )
+
+        total = int(kind_counts["n"].sum())
+        n_chart = int(kind_counts.loc[kind_counts["kind"] == "chart", "n"].sum())
+        n_chrome = int(kind_counts.loc[kind_counts["kind"] == "chrome", "n"].sum())
+        n_desktop = int(kind_counts.loc[kind_counts["kind"] == "desktop", "n"].sum())
+        n_other = int(kind_counts.loc[kind_counts["kind"] == "other", "n"].sum())
+        n_hit = int(status_counts.loc[status_counts["status"] == "hit", "n"].sum())
+        n_miss = int(status_counts.loc[status_counts["status"] == "miss", "n"].sum())
+        n_pending = int(status_counts.loc[status_counts["status"] == "pending", "n"].sum())
+        recoverable = n_chart + n_other  # not chrome/desktop
+        recovery_rate = (n_hit / recoverable) if recoverable else 0.0
+
+        st.subheader("Triage of missing-asset references")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Total refs", f"{total:,}")
+        c2.metric("📊 DeLong charts", f"{n_chart:,}", help="Figures from j-bradford-delong.net — recoverable via Wayback")
+        c3.metric("🧩 Third-party chrome", f"{n_chrome:,}", help="LA Times logo, nav icons, spacers — skip")
+        c4.metric("💾 Desktop folder", f"{n_desktop:,}", help="Files from DeLong's local Mac Desktop — unrecoverable")
+        c5.metric("❓ Other", f"{n_other:,}")
+
+        st.subheader("Wayback recovery result")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("✅ Snapshots found", f"{n_hit:,}")
+        c2.metric("❌ No snapshot", f"{n_miss:,}")
+        c3.metric("⏳ Pending", f"{n_pending:,}")
+        c4.metric(
+            "Recovery rate",
+            f"{recovery_rate:.1%}",
+            help=f"{n_hit} / {recoverable} chart+other references have a Wayback snapshot",
+        )
+
+        if n_pending > 0:
+            st.info(
+                f"{n_pending} references are still pending — run"
+                " `python scripts/wayback_recover.py` to query them against Wayback."
+            )
+
+        st.subheader("Most frequently missing files")
+        top_missing = pd.read_sql_query(
+            """
+            SELECT orig_path, kind, status, wayback_url, COUNT(*) AS posts_affected
+            FROM missing_assets
+            GROUP BY orig_path
+            ORDER BY posts_affected DESC
+            LIMIT 25;
+            """,
+            conn,
+        )
+        st.dataframe(
+            top_missing,
+            use_container_width=True,
+            column_config={
+                "wayback_url": st.column_config.LinkColumn("Wayback", display_text="open"),
+                "orig_path": st.column_config.TextColumn("Path", width="large"),
+                "posts_affected": st.column_config.NumberColumn("Posts affected"),
+            },
+        )
+
+        with st.expander("Browse by post (filterable)"):
+            kind_filter = st.multiselect(
+                "Kind",
+                ["chart", "chrome", "desktop", "other"],
+                default=["chart", "other"],
+            )
+            status_filter = st.multiselect(
+                "Status",
+                ["hit", "miss", "pending", "skip"],
+                default=["hit", "miss", "pending"],
+            )
+            if kind_filter and status_filter:
+                placeholders_k = ",".join("?" * len(kind_filter))
+                placeholders_s = ",".join("?" * len(status_filter))
+                per_post = pd.read_sql_query(
+                    f"""
+                    SELECT p.rel_path, p.title, ma.orig_path, ma.kind, ma.status, ma.wayback_url
+                    FROM missing_assets ma
+                    JOIN posts p ON p.id = ma.post_id
+                    WHERE ma.kind IN ({placeholders_k}) AND ma.status IN ({placeholders_s})
+                    ORDER BY p.rel_path, ma.orig_path
+                    LIMIT 500;
+                    """,
+                    conn,
+                    params=kind_filter + status_filter,
+                )
+                st.dataframe(
+                    per_post,
+                    use_container_width=True,
+                    column_config={
+                        "wayback_url": st.column_config.LinkColumn("Wayback", display_text="open"),
+                    },
+                )
+            else:
+                st.caption("Select at least one kind and status filter.")
+
+        conn.close()
